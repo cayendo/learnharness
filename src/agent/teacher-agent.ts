@@ -19,6 +19,7 @@ import { healToolRecord, withArgumentHeal } from "./tools/heal.ts";
 import { sendToUserTool } from "./tools/send-to-user.ts";
 import { createReadTool, readTool } from "./tools/read.ts";
 import { CLAUDE_CODE_PROVIDER } from "./claude-code/constants.ts";
+import { keepAliveBetweenTurns } from "./claude-code/stream.ts";
 import { quizInputObject, quizInputProblems } from "../core/question-core.ts";
 import { QUESTION_TOOLS, type EnabledTools } from "../core/pending.ts";
 import { toLlmMessages, nativeInputCause, PRACTICE_PROBLEM_TOOL } from "../core/native-messages.ts";
@@ -212,7 +213,8 @@ function baseAgentOptions(kind: AgentKind, opts: AgentBuildOptions, tools: Agent
 			],
 			messages: opts.messages ?? [],
 		},
-		streamFn: engine.streamFn,
+		// A Claude Code child may wait for this chat's next message; other providers ignore the flag.
+		streamFn: keepAliveBetweenTurns(engine.streamFn),
 		...(providerEvents ? { onProviderStreamEvent: providerEvents } : {}),
 		// 0.87.1: shouldStopAfterTurn → finishTurn. Same call point (after
 		// tool results attach, before turn_end) and `{ action: "end" }` still

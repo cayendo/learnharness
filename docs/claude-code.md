@@ -91,13 +91,24 @@ session. [Conversation agents](../src/agent/teacher-agent.ts) pass the existing
 chat ID as Pi's `sessionId`; [background subagent runs](../src/agent/subagents/pi-run.ts)
 get a fresh identity per invocation, stable across that run's tool turns.
 
-A child normally exits after its final response. It is retained only while
-LearnHarness tools are waiting for results, including a learner question. A held
-child can continue only for the same stream owner and nonempty session identity,
-matching tool-result IDs/names, the expected history extension, and unchanged
-model, effort, system prompt, tools, and child environment. Colliding tool IDs in
-two chats or runs do not grant cross-session reuse. A direct caller without a
-session ID can run, but never retains a reusable child.
+A child is retained while LearnHarness tools are waiting for results, including a
+learner question. A held child can continue only for the same stream owner and
+nonempty session identity, matching tool-result IDs/names, the expected history
+extension, and unchanged model, effort, system prompt, tools, and child
+environment. Colliding tool IDs in two chats or runs do not grant cross-session
+reuse. A direct caller without a session ID can run, but never retains a reusable
+child.
+
+After a final response, a background run's child exits. A conversation agent's
+child instead stays **idle** for the chat's next learner message
+(`keepAliveBetweenTurns`): when the history is unchanged and only new user
+messages follow it, those messages go to the idle child as a native user turn, so
+the CLI's prompt cache keeps covering the history instead of a full replay paying
+for it on every message. A changed model or effort is switched in place with
+`set_model` / `apply_flag_settings` control requests before the message; a
+refused or unanswered switch replaces the child with a fresh replay. A changed
+system prompt, tools, environment or history (for example after compaction or a
+phase change) kills the idle child and replays.
 
 If there is no eligible held child—for example after timeout/restart, a changed
 configuration, or history replacement—the next call starts fresh and replays the
@@ -116,12 +127,14 @@ while the child is still eligible resolves its held MCP call. Held children have
 a **10-minute idle timeout**; a later answer instead starts fresh with the question
 and answer in replay. The CLI MCP timeout is **30 minutes**, intentionally longer
 than LearnHarness's idle retention. These are held-tool limits, not a general
-model-request deadline.
+model-request deadline. Idle conversation children close after **55 minutes**,
+inside the CLI's one-hour prompt cache, and at most **3** stay open at once: the
+least recently used one closes first.
 
 Request abort kills the child and ends the active stream as aborted. Cancellation
 of an individual queued MCP call prevents its later admission; it cannot undo
-work already admitted to Pi. Normal completion, abort, failure, and idle expiry
-terminate the child, escalating to `SIGKILL` after one second if necessary. On
+work already admitted to Pi. Background completion, abort, failure, idle expiry
+and eviction terminate the child, escalating to `SIGKILL` after one second if necessary. On
 child close the adapter settles/closes bridge calls, releases the listener, and
 removes its temporary directories. Startup failures also clean allocated
 resources. This is normal-process cleanup, not a promise of cleanup after an OS

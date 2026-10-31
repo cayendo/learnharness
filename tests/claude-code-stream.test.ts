@@ -34,11 +34,11 @@ import { Type } from "typebox";
 
 import { parseCliLine } from "../src/agent/claude-code/cli-events.ts";
 import { ClaudeCodeError } from "../src/agent/claude-code/constants.ts";
-import { LIVE_PROCESS_IDLE_TIMEOUT_MS, liveProcessIdleTimeoutMs } from "../src/agent/claude-code/live-processes.ts";
+import { IDLE_CHAT_TIMEOUT_MS, LIVE_PROCESS_IDLE_TIMEOUT_MS, MAX_IDLE_CHATS, idleChatTimeoutMs, liveProcessIdleTimeoutMs } from "../src/agent/claude-code/live-processes.ts";
 import { CLAUDE_CODE_MODELS } from "../src/agent/claude-code/provider.ts";
 import { authEnvRecord } from "../src/core/auth-env.ts";
 import { ClaudeLaunchError } from "../src/agent/claude-code/launch.ts";
-import { createClaudeCodeStreamFunction, toClaudeArgs, toEffort, type RunClaude } from "../src/agent/claude-code/stream.ts";
+import { createClaudeCodeStreamFunction, keepAliveBetweenTurns, toClaudeArgs, toEffort, type RunClaude } from "../src/agent/claude-code/stream.ts";
 import { toStreamJsonLine } from "../src/agent/claude-code/transcript.ts";
 
 const FAKE_CLAUDE = fileURLToPath(new URL("./fixtures/claude-code/fake-claude.mjs", import.meta.url));
@@ -210,10 +210,11 @@ async function runTurn(
 	streamFunction: StreamFunction<Api, SimpleStreamOptions>,
 	messages: Message[],
 	options?: SimpleStreamOptions,
+	model = getModel(),
 ): Promise<AssistantMessage> {
 	const context = normalizeContext({ systemPrompt: "You are a tutor.", messages, tools: [READ_TOOL] });
 
-	const done = getLastEvent(await collectEvents(streamFunction(getModel(), context, { sessionId: SESSION_ID, ...options })));
+	const done = getLastEvent(await collectEvents(streamFunction(model, context, { sessionId: SESSION_ID, ...options })));
 
 	assert.ok(done.type === "done", `turn ended with ${done.type}`);
 
@@ -1252,4 +1253,120 @@ for (const sharedIdentity of [false, true]) test(`two concurrent stream owners k
 	assert.equal(getText(replyTwo), "from two");
 	assert.equal(one.calls.length, 1);
 	assert.equal(two.calls.length, 1);
+});
+
+const WAIT_FOR_USER = JSON.stringify({ fake: "wait-for-user" });
+const NEXT: Message = { role: "user", content: "and next?", timestamp: 1 };
+
+function textMessage(text: string): string[] {
+	return [
+		streamEvent({ type: "message_start", message: { usage: {} } }),
+		streamEvent({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+		streamEvent({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }),
+		streamEvent({ type: "content_block_stop", index: 0 }),
+		streamEvent({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: {} }),
+		streamEvent({ type: "message_stop" }),
+	];
+}
+
+function createStdinFile(t: TestContext): string {
+	const dir = mkdtempSync(join(tmpdir(), "claude-code-stdin-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	return join(dir, "stdin.jsonl");
+}
+
+function readStdinLines(file: string): Array<{ type: string; request?: { subtype: string } }> {
+	return readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as { type: string; request?: { subtype: string } });
+}
+
+function getSonnet() {
+	const model = CLAUDE_CODE_MODELS.find((candidate) => candidate.id === "sonnet");
+	assert.ok(model);
+	return model;
+}
+
+test("a keep-alive turn holds its child and sends the next learner message as a native user turn, without a new spawn", async (t) => {
+	const stdin = createStdinFile(t);
+	const { runClaude, calls } = createFakeRun(t, [...textMessage("first"), WAIT_FOR_USER, ...textMessage("second")], { FAKE_CLAUDE_STDIN: stdin });
+	const streamFunction = keepAliveBetweenTurns(createClaudeCodeStreamFunction(runClaude));
+
+	const first = await runTurn(streamFunction, [HI]);
+	const second = await runTurn(streamFunction, [HI, first, NEXT]);
+
+	assert.equal(getText(first), "first");
+	assert.equal(getText(second), "second");
+	assert.equal(getOnlyCall(calls).child.exitCode, null);
+	assert.deepEqual(readStdinLines(stdin).filter((line) => line.type === "user").at(-1), JSON.parse(toStreamJsonLine([{ type: "text", text: "and next?" }])));
+});
+
+test("without keep-alive a finished turn still exits and the next message replays in a fresh process", async (t) => {
+	const { runClaude, calls } = createFakeRun(t, textMessage("reply"));
+	const streamFunction = createClaudeCodeStreamFunction(runClaude);
+
+	const first = await runTurn(streamFunction, [HI]);
+	await runTurn(streamFunction, [HI, first, NEXT]);
+
+	assert.equal(calls.length, 2);
+	await assertCleanedUp(calls[0]!);
+});
+
+test("a changed history kills the idle child and replays in a fresh process", async (t) => {
+	const { runClaude, calls } = createFakeRun(t, [...textMessage("reply"), WAIT_FOR_USER, ...textMessage("unused")]);
+	const streamFunction = keepAliveBetweenTurns(createClaudeCodeStreamFunction(runClaude));
+
+	const first = await runTurn(streamFunction, [HI]);
+	const compacted: Message = { role: "user", content: "summary of the earlier lesson", timestamp: 0 };
+	await runTurn(streamFunction, [compacted, first, NEXT]);
+
+	assert.equal(calls.length, 2);
+	await assertCleanedUp(calls[0]!);
+});
+
+test("model and effort changes switch in place with control requests before the learner's message", async (t) => {
+	const stdin = createStdinFile(t);
+	const { runClaude, calls } = createFakeRun(t, [...textMessage("first"), WAIT_FOR_USER, ...textMessage("second")], { FAKE_CLAUDE_STDIN: stdin });
+	const streamFunction = keepAliveBetweenTurns(createClaudeCodeStreamFunction(runClaude));
+
+	const first = await runTurn(streamFunction, [HI]);
+	const second = await runTurn(streamFunction, [HI, first, NEXT], { reasoning: "high" }, getSonnet());
+
+	assert.equal(getText(second), "second");
+	assert.equal(calls.length, 1);
+	const lines = readStdinLines(stdin);
+	const switches = lines.flatMap((line) => line.type === "control_request" && (line.request?.subtype === "set_model" || line.request?.subtype === "apply_flag_settings") ? [line.request] : []);
+	assert.deepEqual(switches, [{ subtype: "set_model", model: "sonnet" }, { subtype: "apply_flag_settings", settings: { effortLevel: "high" } }]);
+	assert.ok(lines.findIndex((line) => line.request?.subtype === "apply_flag_settings") < lines.findLastIndex((line) => line.type === "user"));
+});
+
+test("a refused switch replaces the idle child with a fresh replay on the new model", async (t) => {
+	const { runClaude, calls } = createFakeRun(t, [...textMessage("reply"), WAIT_FOR_USER, ...textMessage("unused")], { FAKE_CLAUDE_SWITCH: "error" });
+	const streamFunction = keepAliveBetweenTurns(createClaudeCodeStreamFunction(runClaude));
+
+	const first = await runTurn(streamFunction, [HI]);
+	await runTurn(streamFunction, [HI, first, NEXT], undefined, getSonnet());
+
+	assert.equal(calls.length, 2);
+	assert.equal(getFlagValue(calls[1]!.args, "--model"), "sonnet");
+	await assertCleanedUp(calls[0]!);
+});
+
+test("an idle child closes after the idle chat timeout", async (t) => {
+	idleChatTimeoutMs.current = 200;
+	t.after(() => (idleChatTimeoutMs.current = IDLE_CHAT_TIMEOUT_MS));
+	const { runClaude, calls } = createFakeRun(t, [...textMessage("reply"), WAIT_FOR_USER]);
+
+	await runTurn(keepAliveBetweenTurns(createClaudeCodeStreamFunction(runClaude)), [HI]);
+
+	await assertCleanedUp(getOnlyCall(calls));
+});
+
+test("only the most recently used idle chats keep their child", async (t) => {
+	const { runClaude, calls } = createFakeRun(t, [...textMessage("reply"), WAIT_FOR_USER]);
+	const streamFunction = keepAliveBetweenTurns(createClaudeCodeStreamFunction(runClaude));
+
+	for (let chat = 0; chat <= MAX_IDLE_CHATS; chat++) await runTurn(streamFunction, [HI], { sessionId: `idle-chat-${chat}` });
+
+	assert.equal(calls.length, MAX_IDLE_CHATS + 1);
+	await assertCleanedUp(calls[0]!);
+	for (const call of calls.slice(1)) assert.equal(call.child.exitCode, null);
 });

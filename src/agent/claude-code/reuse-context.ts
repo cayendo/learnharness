@@ -25,3 +25,10 @@ export function configurationForReuse(model: Model<Api>, context: TranscriptCont
 	// The wire is JSON: TypeBox's schema symbols are not CLI configuration.
 	return JSON.parse(JSON.stringify({ model, effort, systemPrompt, tools })) as unknown;
 }
+
+/** What an idle child cannot change in place: model and effort switch by control request. */
+export function fixedConfigurationForReuse(model: Model<Api>, context: TranscriptContext): unknown {
+	const systemPrompt = getCurrentSystemPrompt(context.messages);
+	const tools = getCurrentTools(context.messages);
+	return JSON.parse(JSON.stringify({ api: model.api, provider: model.provider, systemPrompt, tools })) as unknown;
+}

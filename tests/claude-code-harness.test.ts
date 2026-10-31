@@ -39,6 +39,8 @@ const { chatStore } = await import("../src/store/chats.ts");
 const FAKE_CLAUDE = fileURLToPath(new URL("./fixtures/claude-code/fake-claude.mjs", import.meta.url));
 const TEXT_FIXTURE = fileURLToPath(new URL("./fixtures/claude-code/text.jsonl", import.meta.url));
 const TURN_TIMEOUT_MS = 8000;
+// Long enough for a wrongly killed child to have exited.
+const KEEP_CHECK_MS = 300;
 
 const ASK_ID = "toolu_harness_ask";
 const ASK_INPUT = { question: "What do you already know about sockets?" };
@@ -165,6 +167,13 @@ async function waitForExit(child: ChildProcessWithoutNullStreams): Promise<void>
 	await once(child, "exit", { signal: AbortSignal.timeout(TURN_TIMEOUT_MS) });
 }
 
+/** A finished conversation turn keeps its CLI process for the chat's next message. */
+async function assertKeptForNextMessage(child: ChildProcessWithoutNullStreams): Promise<void> {
+	await sleep(KEEP_CHECK_MS);
+	assert.equal(child.exitCode, null, "a finished conversation turn should keep its CLI process");
+	assert.equal(child.signalCode, null, "a finished conversation turn should keep its CLI process");
+}
+
 test("disabled opt-in refuses a saved CLI chat before write-ahead, liveness, or agent creation", async (t) => {
 	const fakeRun = createFakeRun(t, [toAskScenario()]);
 	const chatId = createClaudeCodeChat(t);
@@ -203,7 +212,7 @@ test("switching off blocks future requests but does not interrupt an already adm
 	child.send("continue"); await finished;
 	assert(getLastAssistantText(chatId).length > 0, "the admitted turn completes normally");
 	assert.equal(readSettings()?.claudeCode?.enabled, false);
-	await waitForExit(child);
+	await assertKeptForNextMessage(child);
 });
 
 test("a question answered before the idle timeout continues the waiting CLI process with the answer", async (t) => {
@@ -226,7 +235,7 @@ test("a question answered before the idle timeout continues the waiting CLI proc
 	assert.deepEqual(cliContextWindowOf(chatStore.getChat(chatId)!.messages), { model: "claude-code:sonnet", tokens: 200000 });
 	assert.deepEqual(cliContextWindowOf(JSON.parse(readFileSync(join(PATHS.chats, `${chatId}.json`), "utf8")).messages), { model: "claude-code:sonnet", tokens: 200000 });
 	assert.ok(getLastAssistantText(chatId).includes(ANSWER_TEXT), getLastAssistantText(chatId));
-	await waitForExit(waiting);
+	await assertKeptForNextMessage(waiting);
 });
 
 test("a question pauses later calls from the same CLI response until the learner answers", async (t) => {
@@ -254,7 +263,7 @@ test("a question pauses later calls from the same CLI response until the learner
 	assert.equal(fakeRun.children.length, 1);
 	assert.ok(getLastAssistantText(chatId).includes(ANSWER_TEXT));
 	assert.ok(getLastAssistantText(chatId).includes("HTTP next"));
-	await waitForExit(fakeRun.children[0]!);
+	await assertKeptForNextMessage(fakeRun.children[0]!);
 });
 
 test("an individually cancelled MCP question queued behind a learner wait never executes", async (t) => {
@@ -288,7 +297,7 @@ test("an individually cancelled MCP question queued behind a learner wait never 
 	assert.equal(danglingQuestionOf(chatStore.getChat(chatId)?.messages ?? []), null);
 	assert.equal(JSON.stringify(chatStore.getChat(chatId)?.messages).includes(cancelledId), false, "cancelled B must never reach native tool execution or persistence");
 	assert.ok(getLastAssistantText(chatId).includes(ANSWER_TEXT));
-	await waitForExit(child);
+	await assertKeptForNextMessage(child);
 });
 
 test("a question answered after the idle timeout starts a fresh CLI process that replays the question and answer", async (t) => {
@@ -316,4 +325,22 @@ test("a question answered after the idle timeout starts a fresh CLI process that
 	assert.ok(replay.includes(ASK_INPUT.question), replay);
 	assert.ok(replay.includes("[tool result ask_user_question]"), replay);
 	assert.ok(replay.includes(ANSWER_TEXT), replay);
+});
+
+test("the learner's next message continues the kept CLI process from the saved chat, without a replay", async (t) => {
+	const text = readFileSync(TEXT_FIXTURE, "utf8").split("\n").filter(Boolean);
+	const fakeRun = createFakeRun(t, [[...text, JSON.stringify({ fake: "wait-for-user" }), ...text]]);
+	const agentFactory = createAgentFactory(fakeRun);
+	const chatId = createClaudeCodeChat(t);
+
+	await runChatTurn(chatId, { type: "text", text: "teach me sockets" }, agentFactory);
+	await runChatTurn(chatId, { type: "text", text: "and then what?" }, agentFactory);
+
+	assert.equal(fakeRun.children.length, 1, "the second message should reuse the kept process");
+	const userLines = readFileSync(fakeRun.stdinFiles[0]!, "utf8").split("\n").filter(Boolean)
+		.map((line) => JSON.parse(line) as { type: string }).filter((line) => line.type === "user");
+	assert.equal(userLines.length, 2);
+	assert.ok(JSON.stringify(userLines[1]).includes("and then what?"));
+	assert.ok(!JSON.stringify(userLines[1]).includes("teach me sockets"), "the follow-up must not replay earlier history");
+	await assertKeptForNextMessage(fakeRun.children[0]!);
 });

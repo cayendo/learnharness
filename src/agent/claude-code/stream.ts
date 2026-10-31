@@ -1,4 +1,5 @@
 import { type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +16,7 @@ import {
 	type SimpleStreamOptions,
 	type StopReason,
 	type StreamFunction,
+	type StreamOptions,
 	type ThinkingLevel,
 	type ToolCall,
 	type ToolResultMessage,
@@ -30,10 +32,10 @@ import { ClaudeLaunchError, createClaudeLauncher } from "./launch.ts";
 import { parseCliLine, type CliBlock, type CliEvent, type CliUsage } from "./cli-events.ts";
 import { ClaudeCodeError } from "./constants.ts";
 import { ContextWindowProbe } from "./context-window.ts";
-import { addLiveProcess, getLiveProcess, removeLiveProcess, type LiveProcess } from "./live-processes.ts";
-import { configurationForReuse, conversationForReuse } from "./reuse-context.ts";
+import { addIdleProcess, addLiveProcess, getIdleProcess, getLiveProcess, removeLiveProcess, type LiveProcess } from "./live-processes.ts";
+import { configurationForReuse, conversationForReuse, fixedConfigurationForReuse } from "./reuse-context.ts";
 import { BRIDGE_SERVER_NAME, createToolBridge, toolNameFromMcp, type PendingToolCall, type ToolBridge } from "./tool-bridge.ts";
-import { toClaudeInput, toStreamJsonLine } from "./transcript.ts";
+import { toClaudeInput, toFollowUpContent, toStreamJsonLine } from "./transcript.ts";
 
 type RunClaudeOptions = { cwd: string; env: NodeJS.ProcessEnv; signal?: AbortSignal };
 
@@ -48,6 +50,22 @@ export type RunClaude = (args: string[], options: RunClaudeOptions) => ClaudeChi
 const MCP_TOOL_TIMEOUT_MS = 30 * 60_000;
 
 const PRIVATE_FILE_MODE = 0o600;
+
+// A model or effort switch waits for the CLI's acknowledgement before the learner's message;
+// no reply in time means the idle child is replaced by a fresh replay.
+const CONTROL_TIMEOUT_MS = 10_000;
+
+// Set only by conversation agents, never by background runs: a finished turn may then keep
+// its child for the chat's next learner message instead of replaying the history.
+const KEEP_ALIVE_OPTION = "claudeCodeKeepAlive";
+
+export function keepAliveBetweenTurns(streamFn: StreamFunction): StreamFunction {
+	return (model, context, options) => streamFn(model, context, { ...options, [KEEP_ALIVE_OPTION]: true } as StreamOptions);
+}
+
+function keepsAlive(options: SimpleStreamOptions | undefined): boolean {
+	return (options as Record<string, unknown> | undefined)?.[KEEP_ALIVE_OPTION] === true;
+}
 
 const EFFORTS: Record<ThinkingLevel, AnthropicEffort> = {
 	minimal: "low",
@@ -238,6 +256,9 @@ class ClaudeTurn {
 
 	get waitingForAdmission(): boolean { return !this.finished && this.output.stopReason === "toolUse"; }
 
+	/** Ended with a final answer, not a tool batch, error, or abort. */
+	get completed(): boolean { return this.finished && (this.output.stopReason === "stop" || this.output.stopReason === "length"); }
+
 	getIntents(): ToolCall[] { return this.intents; }
 
 	getMessage(): AssistantMessage { return this.output; }
@@ -405,8 +426,12 @@ async function removeTurnResources(bridge: ToolBridge, files: TurnFiles): Promis
 	]);
 }
 
+type Settings = { configuration: unknown; fixedConfiguration: unknown; modelId: string; effort: AnthropicEffort; keepAlive: boolean };
+
 class ClaudeProcess implements LiveProcess {
 	toolCallIds: string[] = [];
+	idle = false;
+	private readonly controls = new Map<string, (ok: boolean) => void>();
 	private stderr = "";
 	private closed = false;
 	private stopping = false;
@@ -427,7 +452,7 @@ class ClaudeProcess implements LiveProcess {
 		private turn: ClaudeTurn,
 		readonly owner: symbol,
 		readonly sessionId: string | undefined,
-		private readonly configuration: unknown,
+		private settings: Settings,
 		private conversation: unknown[],
 	) {}
 
@@ -457,7 +482,7 @@ class ClaudeProcess implements LiveProcess {
 	canContinue(owner: symbol, sessionId: string | undefined, configuration: unknown, messages: Message[], results: ToolResultMessage[]): boolean {
 		const conversation = conversationForReuse(messages);
 		return !this.stopping && owner === this.owner && !!sessionId && sessionId === this.sessionId
-			&& isDeepStrictEqual(configuration, this.configuration)
+			&& isDeepStrictEqual(configuration, this.settings.configuration)
 			&& isDeepStrictEqual(conversation.slice(0, this.conversation.length), this.conversation)
 			&& conversation.length === this.conversation.length + this.admitted.length
 			&& results.length === this.admitted.length
@@ -480,6 +505,41 @@ class ClaudeProcess implements LiveProcess {
 			this.bridge.resolveToolCall(call, result);
 		}
 		this.flushAdmissions();
+	}
+
+	/** The chat's history is unchanged and only new learner messages follow it. */
+	canContinueIdle(fixedConfiguration: unknown, messages: Message[]): boolean {
+		const conversation = conversationForReuse(messages);
+		const added = messages.filter((message) => message.role !== "system").slice(this.conversation.length);
+		return this.idle && !this.stopping
+			&& isDeepStrictEqual(fixedConfiguration, this.settings.fixedConfiguration)
+			&& isDeepStrictEqual(conversation.slice(0, this.conversation.length), this.conversation)
+			&& added.length > 0 && added.every((message) => message.role === "user");
+	}
+
+	/** Resolves false when the child cannot take the turn; the caller then starts a fresh replay. */
+	async continueIdle(turn: ClaudeTurn, messages: Message[], settings: Settings, signal: AbortSignal | undefined): Promise<boolean> {
+		removeLiveProcess(this);
+		this.idle = false;
+		const switches = [
+			...(settings.modelId !== this.settings.modelId ? [{ subtype: "set_model", model: settings.modelId }] : []),
+			...(settings.effort !== this.settings.effort ? [{ subtype: "apply_flag_settings", settings: { effortLevel: settings.effort } }] : []),
+		];
+		for (const request of switches) {
+			if (!(await this.control(request))) {
+				this.kill();
+				return false;
+			}
+		}
+		if (this.stopping) return false;
+		const added = messages.filter((message) => message.role !== "system").slice(this.conversation.length);
+		this.settings = settings;
+		this.conversation = structuredClone(conversationForReuse(messages));
+		this.turn = turn;
+		this.turn.setContextWindow(this.contextWindow);
+		this.setSignal(signal);
+		if (!this.stopping) this.child.stdin.write(`${toStreamJsonLine(toFollowUpContent(added))}\n`);
+		return true;
 	}
 
 	kill(): void {
@@ -546,6 +606,45 @@ class ClaudeProcess implements LiveProcess {
 		this.kill();
 	};
 
+	private finishTurn(): void {
+		if (!this.settings.keepAlive || !this.sessionId || !this.turn.completed) { this.kill(); return; }
+		this.conversation.push(...structuredClone(conversationForReuse([this.turn.getMessage()])));
+		this.toolCallIds = [];
+		this.sourceCalls = [];
+		this.sourceComplete = false;
+		this.admitted = [];
+		this.setSignal(undefined);
+		this.idle = true;
+		addIdleProcess(this);
+	}
+
+	private control(request: Record<string, unknown>): Promise<boolean> {
+		if (this.stopping || this.closed) return Promise.resolve(false);
+		const id = randomUUID();
+		return new Promise((resolve) => {
+			const timer = setTimeout(() => this.settleControl(id, false), CONTROL_TIMEOUT_MS);
+			timer.unref();
+			this.controls.set(id, (ok) => { clearTimeout(timer); resolve(ok); });
+			this.child.stdin.write(`${JSON.stringify({ type: "control_request", request_id: id, request })}\n`);
+		});
+	}
+
+	private settleControl(id: string, ok: boolean): void {
+		const settle = this.controls.get(id);
+		this.controls.delete(id);
+		settle?.(ok);
+	}
+
+	/** Consumes this process's own control replies before the context probe sees them. */
+	private handleControlResponse(value: unknown): boolean {
+		if (!value || typeof value !== "object" || !("type" in value) || value.type !== "control_response" || !("response" in value)) return false;
+		const response = value.response as Record<string, unknown> | null;
+		const id = response?.request_id;
+		if (typeof id !== "string" || !this.controls.has(id)) return false;
+		this.settleControl(id, response?.subtype === "success");
+		return true;
+	}
+
 	private setSignal(signal: AbortSignal | undefined): void {
 		this.signal?.removeEventListener("abort", this.abort);
 		this.signal = signal;
@@ -555,7 +654,9 @@ class ClaudeProcess implements LiveProcess {
 
 	private handleLine(line: string): void {
 		if (this.stopping || !line.trim()) return;
-		if (this.contextProbe?.handle(JSON.parse(line))) return;
+		const value: unknown = JSON.parse(line);
+		if (this.handleControlResponse(value)) return;
+		if (this.contextProbe?.handle(value)) return;
 		const event = parseCliLine(line);
 		if (!event) return;
 		if (event.type === "toolResults") {
@@ -576,7 +677,7 @@ class ClaudeProcess implements LiveProcess {
 		}
 		if (event.type === "messageStart") this.contextProbe?.refresh();
 		this.turn.handle(event);
-		if (this.turn.finished) { this.kill(); return; }
+		if (this.turn.finished) { this.finishTurn(); return; }
 		if (event.type === "messageStop" && this.turn.waitingForAdmission) {
 			const intents = this.turn.getIntents();
 			// Only rejected bare calls: keep the turn open for the model's retry in its next message.
@@ -595,6 +696,7 @@ class ClaudeProcess implements LiveProcess {
 		if (this.closed) return;
 		this.closed = true;
 		this.contextProbe?.close();
+		for (const id of [...this.controls.keys()]) this.settleControl(id, false);
 		clearTimeout(this.killTimer);
 		removeLiveProcess(this);
 		if (this.pendingError) addLiveProcess(this);
@@ -625,6 +727,15 @@ function continueLiveProcess(turn: ClaudeTurn, owner: symbol, sessionId: string 
 	return true;
 }
 
+function takeIdleProcess(owner: symbol, sessionId: string | undefined, fixedConfiguration: unknown, messages: Message[]): ClaudeProcess | null {
+	const process = getIdleProcess(owner, sessionId);
+	if (!(process instanceof ClaudeProcess)) return null;
+	if (process.canContinueIdle(fixedConfiguration, messages)) return process;
+	// The history, prompt, tools or environment changed: this chat replays from here.
+	process.kill();
+	return null;
+}
+
 function toClaudeEnv(): NodeJS.ProcessEnv {
 	// Preserve native CLI auth/routing, including launch-environment credentials.
 	// Claude Code chooses the account and billing method, not LearnHarness.
@@ -638,7 +749,7 @@ async function startProcess(
 	context: TranscriptContext,
 	options: SimpleStreamOptions | undefined,
 	owner: symbol,
-	configuration: unknown,
+	settings: Settings,
 	env: NodeJS.ProcessEnv,
 ): Promise<void> {
 	if (options?.signal?.aborted) { turn.fail(ABORT_MESSAGE, "aborted"); return; }
@@ -665,8 +776,8 @@ async function startProcess(
 	let child: ChildProcessWithoutNullStreams | null;
 	try {
 		const args = toClaudeArgs({
-			model: model.id,
-			effort: toEffort(options?.reasoning),
+			model: settings.modelId,
+			effort: settings.effort,
 			systemPromptFile: files.systemPromptFile,
 			mcpConfigFile: files.mcpConfigFile,
 			allowedTools: bridge.allowedTools,
@@ -683,7 +794,7 @@ async function startProcess(
 		return;
 	}
 
-	cliProcess = new ClaudeProcess(child, bridge, files, turn, owner, options?.sessionId, configuration, structuredClone(conversationForReuse(context.messages)));
+	cliProcess = new ClaudeProcess(child, bridge, files, turn, owner, options?.sessionId, settings, structuredClone(conversationForReuse(context.messages)));
 	cliProcess.start(toStreamJsonLine(input.userContent), options?.signal);
 }
 
@@ -694,14 +805,26 @@ export function createClaudeCodeStreamFunction(runClaude: RunClaude): StreamFunc
 		const turn = new ClaudeTurn(stream, model, new Set(getCurrentTools(context.messages).map((tool) => tool.name)));
 
 		const env = toClaudeEnv();
+		const effort = toEffort(options?.reasoning);
 		// An existing child must not retain stale authentication/routing after env changes.
-		const configuration = { request: configurationForReuse(model, context, toEffort(options?.reasoning)), env };
+		const configuration = { request: configurationForReuse(model, context, effort), env };
 		if (continueLiveProcess(turn, owner, options?.sessionId, configuration, context.messages, options?.signal)) return stream;
 
-		startProcess(runClaude, turn, model, context, options, owner, configuration, env).catch((error: unknown) => {
+		const settings: Settings = {
+			configuration,
+			fixedConfiguration: { request: fixedConfigurationForReuse(model, context), env },
+			modelId: model.id,
+			effort,
+			keepAlive: keepsAlive(options),
+		};
+		const start = () => startProcess(runClaude, turn, model, context, options, owner, settings, env).catch((error: unknown) => {
 			console.error("claude CLI turn failed:", error);
 			turn.fail(options?.signal?.aborted ? ABORT_MESSAGE : error instanceof ClaudeLaunchError ? error.message : START_FAILED_MESSAGE, options?.signal?.aborted ? "aborted" : "error");
 		});
+
+		const idle = takeIdleProcess(owner, options?.sessionId, settings.fixedConfiguration, context.messages);
+		if (idle) void idle.continueIdle(turn, context.messages, settings, options?.signal).catch(() => false).then((continued) => { if (!continued) void start(); });
+		else void start();
 
 		return stream;
 	};

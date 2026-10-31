@@ -94,6 +94,11 @@ export function toClaudeInput(messages: Message[]): ClaudeInput {
 	};
 }
 
+/** An idle child already holds the history: only the learner's new messages go in, as a native user turn. */
+export function toFollowUpContent(messages: Message[]): ClaudeContentBlock[] {
+	return messages.flatMap((message) => (message.role === "user" ? toUnlabelledBlocks(message.content) : []));
+}
+
 export function toStreamJsonLine(content: ClaudeContentBlock[]): string {
 	return JSON.stringify({ type: "user", message: { role: "user", content } });
 }

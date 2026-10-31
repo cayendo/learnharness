@@ -11,7 +11,9 @@
  *   {"fake":"wait-for-message"}              pause until the test releases the child over IPC
  *   {"fake":"ignore-term"}                   ignore SIGTERM to exercise kill escalation
  *   {"fake":"reply"}                         stream one assistant message whose text is every result so far, joined by " | "
+ *   {"fake":"wait-for-user"}                 pause until the next user message arrives on stdin, like a held CLI between turns
  * FAKE_CLAUDE_STDIN, when set, receives the stdin it read.
+ * FAKE_CLAUDE_SWITCH=error|ignore makes set_model/apply_flag_settings control requests fail or go unanswered.
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { on } from "node:events";
@@ -57,14 +59,29 @@ async function writeReply(text) {
 const mcpConfig = readFileSync(process.argv[process.argv.indexOf("--mcp-config") + 1], "utf8");
 
 let input = "";
-let receiveUser;
-const userReceived = new Promise((resolve) => { receiveUser = resolve; });
+let usersReceived = 0;
+let userWaiters = [];
+function waitForUsers(count) {
+	return usersReceived >= count ? Promise.resolve() : new Promise((resolve) => userWaiters.push({ count, resolve }));
+}
 createInterface({ input: process.stdin }).on("line", async (line) => {
 	input += `${line}\n`;
 	const message = JSON.parse(line);
 	if (message.type !== "control_request") {
 		if (process.env.FAKE_CLAUDE_STDIN) writeFileSync(process.env.FAKE_CLAUDE_STDIN, input);
-		receiveUser(); return;
+		usersReceived++;
+		const ready = userWaiters.filter((waiter) => waiter.count <= usersReceived);
+		userWaiters = userWaiters.filter((waiter) => waiter.count > usersReceived);
+		for (const waiter of ready) waiter.resolve();
+		return;
+	}
+	if (message.request.subtype === "set_model" || message.request.subtype === "apply_flag_settings") {
+		if (process.env.FAKE_CLAUDE_SWITCH === "ignore") return;
+		await writeLine(JSON.stringify({ type: "control_response", response: {
+			request_id: message.request_id, subtype: process.env.FAKE_CLAUDE_SWITCH === "error" ? "error" : "success",
+			response: {}, error: "unsupported switch",
+		} }));
+		return;
 	}
 	if (message.request.subtype === "initialize") {
 		if (process.env.FAKE_CLAUDE_INIT === "ignore") return;
@@ -79,7 +96,8 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
 		} }));
 	}
 });
-await userReceived;
+let usersExpected = 1;
+await waitForUsers(usersExpected);
 
 let bridge = null;
 const results = [];
@@ -103,6 +121,10 @@ for (const line of lines) {
 	}
 	if (directive.fake === "wait-for-message") {
 		await parentMessages.next();
+		continue;
+	}
+	if (directive.fake === "wait-for-user") {
+		await waitForUsers(++usersExpected);
 		continue;
 	}
 	if (directive.fake === "hold") {
