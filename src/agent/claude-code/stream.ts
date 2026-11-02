@@ -116,6 +116,9 @@ export function toClaudeArgs(input: ClaudeArgsInput): string[] {
 		input.model,
 		"--effort",
 		input.effort,
+		// Print mode otherwise streams thinking blocks with no text.
+		"--thinking-display",
+		"summarized",
 		"--system-prompt-file",
 		input.systemPromptFile,
 		"--tools",

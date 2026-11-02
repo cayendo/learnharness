@@ -78,6 +78,8 @@ working directory; the system prompt and token-bearing MCP configuration are in
 a separate temporary directory, with files created in owner-only mode. Launch
 arguments select user settings only, disable hooks and slash commands, disable
 CLI session persistence and permission prompts, and restrict tools/MCP as above.
+They also request summarized thinking (`--thinking-display summarized`): without
+it, print mode streams thinking blocks with no text.
 These are integration boundaries, **not an OS sandbox, legal certification, or a
 blanket claim about provider-policy compliance**. User CLI settings and native
 authentication are intentionally retained. Provider terms and account limits still
