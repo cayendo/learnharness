@@ -899,29 +899,6 @@ test("mismatched result id starts fresh and kills the old process", async (t) =>
 	await assertCleanedUp(oldCall);
 });
 
-test("user message after tool results starts fresh with unfinished calls in the replay", async (t) => {
-	const stdinFile = join(mkdtempSync(join(tmpdir(), "claude-code-stdin-")), "stdin.jsonl");
-	t.after(() => rmSync(dirname(stdinFile), { recursive: true, force: true }));
-
-	const readA: ToolUse = { id: "toolu_steer_a", name: "read", arguments: { path: "a" } };
-	const { runClaude, calls } = createFakeRun(t, [...toToolUseMessage([readA]), callTool(readA), REPLY], { FAKE_CLAUDE_STDIN: stdinFile });
-	const streamFunction = createClaudeCodeStreamFunction(runClaude);
-	const toolMessage = await runTurn(streamFunction, [HI]);
-	const steer: Message = { role: "user", content: "wait, explain sockets first", timestamp: 0 };
-
-	await runTurn(streamFunction, [HI, toolMessage, toToolResult(readA, "A"), steer]);
-
-	assert.equal(calls.length, 2);
-
-	const [oldCall] = calls;
-	assert.ok(oldCall);
-	await assertCleanedUp(oldCall);
-
-	const stdin = readFileSync(stdinFile, "utf8");
-	assert.ok(stdin.includes('[tool call read] {\\"path\\":\\"a\\"}'), stdin);
-	assert.ok(stdin.includes("wait, explain sockets first"), stdin);
-});
-
 test("output while waiting for tool results kills the process", async (t) => {
 	const readA: ToolUse = { id: "toolu_moved_on_a", name: "read", arguments: { path: "a" } };
 	const { runClaude, calls } = createFakeRun(t, [...toToolUseMessage([readA]), REPLY, HOLD]);
@@ -1299,6 +1276,21 @@ test("a keep-alive turn holds its child and sends the next learner message as a 
 	assert.equal(getText(second), "second");
 	assert.equal(getOnlyCall(calls).child.exitCode, null);
 	assert.deepEqual(readStdinLines(stdin).filter((line) => line.type === "user").at(-1), JSON.parse(toStreamJsonLine([{ type: "text", text: "and next?" }])));
+});
+
+test("messages that arrive with the tool results continue the held child as a user message, without a replay", async (t) => {
+	const readA: ToolUse = { id: "toolu_joined_a", name: "read", arguments: { path: "a" } };
+	const stdin = createStdinFile(t);
+	const { runClaude, calls } = createFakeRun(t, [...toToolUseMessage([readA]), callTool(readA), REPLY], { FAKE_CLAUDE_STDIN: stdin });
+	const streamFunction = createClaudeCodeStreamFunction(runClaude);
+	const toolMessage = await runTurn(streamFunction, [HI]);
+	const steer: Message = { role: "user", content: "Research complete.", timestamp: 2 };
+
+	const reply = await runTurn(streamFunction, [HI, toolMessage, toToolResult(readA, "contents of a"), steer]);
+
+	assert.equal(getText(reply), "contents of a");
+	assert.equal(calls.length, 1);
+	assert.deepEqual(readStdinLines(stdin).filter((line) => line.type === "user").at(-1), JSON.parse(toStreamJsonLine([{ type: "text", text: "Research complete." }])));
 });
 
 test("without keep-alive a finished turn still exits and the next message replays in a fresh process", async (t) => {

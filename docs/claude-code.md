@@ -98,7 +98,10 @@ learner question. A held child can continue only for the same stream owner and
 nonempty session identity, matching tool-result IDs/names, the expected history
 extension, and unchanged model, effort, system prompt, tools, and child
 environment. Colliding tool IDs in two chats or runs do not grant cross-session
-reuse. A direct caller without a session ID can run, but never retains a reusable
+reuse. User messages that arrive with the results (finished background jobs,
+the learner's words) are written to the child as a user message just before the
+results are released; the CLI adds them to the same turn's next request instead
+of the chat replaying. A direct caller without a session ID can run, but never retains a reusable
 child.
 
 After a final response, a background run's child exits. A conversation agent's

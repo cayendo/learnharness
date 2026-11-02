@@ -482,18 +482,18 @@ class ClaudeProcess implements LiveProcess {
 		if (!this.stopping) this.contextProbe.start();
 	}
 
-	canContinue(owner: symbol, sessionId: string | undefined, configuration: unknown, messages: Message[], results: ToolResultMessage[]): boolean {
+	canContinue(owner: symbol, sessionId: string | undefined, configuration: unknown, messages: Message[], results: ToolResultMessage[], addedCount: number): boolean {
 		const conversation = conversationForReuse(messages);
 		return !this.stopping && owner === this.owner && !!sessionId && sessionId === this.sessionId
 			&& isDeepStrictEqual(configuration, this.settings.configuration)
 			&& isDeepStrictEqual(conversation.slice(0, this.conversation.length), this.conversation)
-			&& conversation.length === this.conversation.length + this.admitted.length
+			&& conversation.length === this.conversation.length + this.admitted.length + addedCount
 			&& results.length === this.admitted.length
 			&& new Set(results.map((result) => result.toolCallId)).size === results.length
 			&& this.admitted.every((call) => results.some((result) => result.toolCallId === call.id && result.toolName === call.name));
 	}
 
-	continueTurn(turn: ClaudeTurn, messages: Message[], results: ToolResultMessage[], signal: AbortSignal | undefined): void {
+	continueTurn(turn: ClaudeTurn, messages: Message[], results: ToolResultMessage[], added: Message[], signal: AbortSignal | undefined): void {
 		removeLiveProcess(this);
 		const admitted = this.admitted;
 		this.admitted = [];
@@ -503,6 +503,8 @@ class ClaudeProcess implements LiveProcess {
 		this.sourceComplete = this.sourceCalls.length > 0;
 		this.setSignal(signal);
 		if (this.stopping) return;
+		// Written before the results are released, the CLI adds these to the same turn's next request.
+		if (added.length > 0) this.child.stdin.write(`${toStreamJsonLine(toFollowUpContent(added))}\n`);
 		for (const call of admitted) {
 			const result = results.find((candidate) => candidate.toolCallId === call.id)!;
 			this.bridge.resolveToolCall(call, result);
@@ -722,11 +724,13 @@ function continueLiveProcess(turn: ClaudeTurn, owner: symbol, sessionId: string 
 	if (process.consumeFailure(owner, turn)) return true;
 	const trailing = messages.slice(assistantIndex + 1);
 	const results = trailing.filter((message) => message.role === "toolResult");
-	if (trailing.length !== results.length || !process.canContinue(owner, sessionId, configuration, messages, results)) {
+	// Job results and the learner's words that arrived while the calls ran join the same turn.
+	const added = trailing.filter((message) => message.role === "user");
+	if (results.length + added.length !== trailing.length || !process.canContinue(owner, sessionId, configuration, messages, results, added.length)) {
 		process.kill();
 		return false;
 	}
-	process.continueTurn(turn, messages, results, signal);
+	process.continueTurn(turn, messages, results, added, signal);
 	return true;
 }
 
